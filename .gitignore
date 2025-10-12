@@ -1,0 +1,27 @@
+# ---- Python / env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# ---- IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- Build & logs
+dist/
+build/
+*.log
+
+# ---- Project-specific (DON'T COMMIT DATA OR OUTPUTS)
+data/
+outputs/
+!outputs/.gitkeep
+
+# ---- Jupyter
+.ipynb_checkpoints/
