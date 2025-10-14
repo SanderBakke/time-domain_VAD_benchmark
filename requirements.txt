@@ -4,3 +4,4 @@ soundfile
 tqdm
 scikit-learn
 matplotlib
+webrtcvad
