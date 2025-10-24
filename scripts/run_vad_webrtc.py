@@ -1,576 +1,196 @@
-# # # #!/usr/bin/env python
-# # # # scripts/run_vad_webrtc.py
-# # # # WebRTC VAD benchmark (levels 0–3) on Speech Commands dataset.
-# # # # Supports --timing_only for pure processing benchmarks.
-
-# # # import argparse, csv, time, datetime
-# # # from pathlib import Path
-# # # import numpy as np
-# # # import webrtcvad
-
-# # # from vad.datasets import iter_dataset
-
-
-# # # def wav_to_int16_bytes(x: np.ndarray) -> bytes:
-# # #     x = np.clip(x, -1.0, 1.0)
-# # #     return (x * 32768.0).astype(np.int16).tobytes()
-
-
-# # # def make_frames(x: np.ndarray, fs: int, frame_ms: int, hop_ms: int) -> np.ndarray:
-# # #     """Split signal into overlapping frames (frame_ms, hop_ms)."""
-# # #     frame_len = int(round(fs * frame_ms / 1000))
-# # #     hop = int(round(fs * hop_ms / 1000))
-# # #     if frame_len <= 0 or hop <= 0 or len(x) < frame_len:
-# # #         return np.zeros((0, frame_len), dtype=np.float32)
-# # #     n = 1 + (len(x) - frame_len) // hop
-# # #     out = np.empty((n, frame_len), dtype=np.float32)
-# # #     for i, start in enumerate(range(0, len(x) - frame_len + 1, hop)):
-# # #         out[i] = x[start:start + frame_len]
-# # #     return out
-
-
-# # # def smooth_hangover(decisions: np.ndarray, hop_ms: int, hangover_ms: int):
-# # #     """Apply hangover smoothing to binary decisions."""
-# # #     if hangover_ms <= 0 or decisions.size == 0:
-# # #         return decisions
-# # #     hang = int(np.ceil(hangover_ms / hop_ms))
-# # #     out = decisions.copy().astype(np.int32)
-# # #     last_on = -10**9
-# # #     for i, d in enumerate(decisions):
-# # #         if d == 1:
-# # #             last_on = i
-# # #             out[i] = 1
-# # #         elif i - last_on <= hang:
-# # #             out[i] = 1
-# # #     return out.astype(np.int32)
-
-
-# # # def main():
-# # #     ap = argparse.ArgumentParser(description="Run WebRTC VAD on Speech Commands.")
-# # #     ap.add_argument("--data_dir", required=True)
-# # #     ap.add_argument("--aggressiveness", type=int, default=2, choices=[0, 1, 2, 3])
-# # #     ap.add_argument("--frame_ms", type=int, default=20, choices=[10, 20, 30])
-# # #     ap.add_argument("--hop_ms", type=int, default=10)
-# # #     ap.add_argument("--hangover_ms", type=int, default=200)
-# # #     ap.add_argument("--max_files", type=int, default=None)
-# # #     ap.add_argument("--seed", type=int, default=0)
-# # #     ap.add_argument("--out_csv", type=str, default=None)
-# # #     ap.add_argument("--emit_scores", action="store_true")
-# # #     ap.add_argument("--scores_csv", type=str, default=None)
-
-# # #     # Timing-only controls
-# # #     ap.add_argument("--timing_only", action="store_true", help="Disable all I/O; measure pure processing time.")
-# # #     ap.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bar.")
-# # #     ap.add_argument("--timing_note", type=str, default="", help="Optional note string for timing logs.")
-
-# # #     args = ap.parse_args()
-
-# # #     fs = 16000
-# # #     level = args.aggressiveness
-# # #     model_name = f"webrtc_l{level}"
-
-# # #     out_clips = Path(args.out_csv) if args.out_csv else Path(f"outputs/clips/clip_results_{model_name}.csv")
-# # #     out_frames = Path(args.scores_csv) if args.scores_csv else Path(f"outputs/frames/frame_scores_{model_name}.csv")
-
-# # #     if not args.timing_only:
-# # #         out_clips.parent.mkdir(parents=True, exist_ok=True)
-# # #         if args.emit_scores:
-# # #             out_frames.parent.mkdir(parents=True, exist_ok=True)
-
-# # #     runtime_csv = Path("outputs/runtime/runtime_summary.csv")
-# # #     runtime_timing_csv = Path("outputs/runtime_timing/runtime_summary.csv")
-# # #     dset_csv = Path("outputs/dataset_stats/dataset_summary.csv")
-
-# # #     for p in [runtime_csv, runtime_timing_csv, dset_csv]:
-# # #         p.parent.mkdir(parents=True, exist_ok=True)
-
-# # #     vad = webrtcvad.Vad(level)
-
-# # #     total_sec_audio = 0.0
-# # #     n_clips_speech = n_clips_noise = 0
-# # #     total_frames_speech = total_frames_noise = 0
-
-# # #     # Optional output setup
-# # #     if not args.timing_only:
-# # #         fc = open(out_clips, "w", newline="", encoding="utf-8")
-# # #         cw = csv.writer(fc)
-# # #         cw.writerow(["source", "label", "pred"])
-# # #         if args.emit_scores:
-# # #             ff = open(out_frames, "w", newline="", encoding="utf-8")
-# # #             fw = csv.writer(ff)
-# # #             fw.writerow(["source", "frame_idx", "label_frame", "score", "prob"])
-# # #     else:
-# # #         cw = fw = None
-
-# # #     from vad.metrics import Timer
-# # #     from tqdm import tqdm
-# # #     iterator = iter_dataset(args.data_dir, max_files=args.max_files, seed=args.seed)
-# # #     if not args.no_progress and not args.timing_only:
-# # #         iterator = tqdm(iterator, desc=f"WebRTC L{level} clips")
-
-# # #     with Timer() as t_total:
-# # #         for x, label_clip, src in iterator:
-# # #             frames = make_frames(x, fs, args.frame_ms, args.hop_ms)
-# # #             T = frames.shape[0]
-# # #             decisions = np.zeros(T, dtype=np.int32)
-
-# # #             for i in range(T):
-# # #                 f = frames[i]
-# # #                 decisions[i] = 1 if vad.is_speech(wav_to_int16_bytes(f), fs) else 0
-
-# # #             decisions = smooth_hangover(decisions, args.hop_ms, args.hangover_ms)
-# # #             pred_clip = int(decisions.any())
-
-# # #             if label_clip == 1:
-# # #                 n_clips_speech += 1
-# # #                 total_frames_speech += T
-# # #             else:
-# # #                 n_clips_noise += 1
-# # #                 total_frames_noise += T
-
-# # #             if not args.timing_only:
-# # #                 cw.writerow([src, int(label_clip), pred_clip])
-# # #                 if args.emit_scores:
-# # #                     for i, d in enumerate(decisions):
-# # #                         fw.writerow([src, i, int(label_clip), float(d), float(d)])
-
-# # #             total_sec_audio += len(x) / fs
-
-# # #     wall = t_total.dt
-# # #     hours_audio = total_sec_audio / 3600.0
-# # #     sec_per_hour = (wall / hours_audio) if hours_audio > 0 else float("nan")
-
-# # #     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-# # #     note = args.timing_note or f"frame={args.frame_ms} hop={args.hop_ms} hang={args.hangover_ms}"
-
-# # #     header = ["model", "sec_per_hour", "date", "note"]
-# # #     line = {"model": model_name, "sec_per_hour": f"{sec_per_hour:.2f}", "date": stamp, "note": note}
-
-# # #     # Log appropriately
-# # #     target_log = runtime_timing_csv if args.timing_only else runtime_csv
-# # #     exists = target_log.exists()
-# # #     with open(target_log, "a", newline="", encoding="utf-8") as f:
-# # #         w = csv.DictWriter(f, fieldnames=header)
-# # #         if not exists:
-# # #             w.writeheader()
-# # #         w.writerow(line)
-
-# # #     # Dataset stats (only once per model)
-# # #     if not args.timing_only:
-# # #         dset_exists = dset_csv.exists()
-# # #         ds_header = ["model","num_speech_clips","num_noise_clips","total_frames_speech","total_frames_noise"]
-# # #         ds_line = {
-# # #             "model": model_name,
-# # #             "num_speech_clips": n_clips_speech,
-# # #             "num_noise_clips": n_clips_noise,
-# # #             "total_frames_speech": total_frames_speech,
-# # #             "total_frames_noise": total_frames_noise,
-# # #         }
-# # #         with open(dset_csv, "a", newline="", encoding="utf-8") as f:
-# # #             w = csv.DictWriter(f, fieldnames=ds_header)
-# # #             if not dset_exists:
-# # #                 w.writeheader()
-# # #             w.writerow(ds_line)
-
-# # #     if not args.timing_only:
-# # #         if args.emit_scores:
-# # #             ff.close()
-# # #         fc.close()
-
-# # #     print(f"\n[{model_name}] {'TIMING' if args.timing_only else 'FULL'} sec/hour: {sec_per_hour:.2f}")
-# # #     print(f"[{model_name}] Logged to: {target_log}")
-
-
-# # # if __name__ == "__main__":
-# # #     main()
-
-
-# # #!/usr/bin/env python
-# # # scripts/run_vad_webrtc.py
-# # # WebRTC VAD benchmark (levels 0–3). Supports --timing_only and --repeat N.
-
-# # import argparse, csv, datetime
-# # from pathlib import Path
-# # import numpy as np
-# # import webrtcvad
-
-# # from vad.datasets import iter_dataset
-# # from vad.metrics import Timer
-
-
-# # def wav_to_int16_bytes(x: np.ndarray) -> bytes:
-# #     x = np.clip(x, -1.0, 1.0)
-# #     return (x * 32768.0).astype(np.int16).tobytes()
-
-
-# # def make_frames(x: np.ndarray, fs: int, frame_ms: int, hop_ms: int) -> np.ndarray:
-# #     frame_len = int(round(fs * frame_ms / 1000))
-# #     hop = int(round(fs * hop_ms / 1000))
-# #     if frame_len <= 0 or hop <= 0 or len(x) < frame_len:
-# #         return np.zeros((0, frame_len), dtype=np.float32)
-# #     n = 1 + (len(x) - frame_len) // hop
-# #     out = np.empty((n, frame_len), dtype=np.float32)
-# #     for i, start in enumerate(range(0, len(x) - frame_len + 1, hop)):
-# #         out[i] = x[start:start+frame_len]
-# #     return out
-
-
-# # def smooth_hangover(decisions: np.ndarray, hop_ms: int, hangover_ms: int):
-# #     if hangover_ms <= 0 or decisions.size == 0:
-# #         return decisions
-# #     hang = int(np.ceil(hangover_ms / hop_ms))
-# #     out = decisions.copy().astype(np.int32)
-# #     last_on = -10**9
-# #     for i, d in enumerate(decisions):
-# #         if d == 1:
-# #             last_on = i
-# #             out[i] = 1
-# #         elif i - last_on <= hang:
-# #             out[i] = 1
-# #     return out.astype(np.int32)
-
-
-# # def model_name(level: int) -> str:
-# #     return f"webrtc_l{level}"
-
-
-# # def run_once(args, collect_outputs=True):
-# #     fs = 16000
-# #     vad = webrtcvad.Vad(args.aggressiveness)
-
-# #     n_sp = n_ns = 0
-# #     tot_sec_audio = 0.0
-# #     rows = []
-
-# #     iterator = iter_dataset(args.data_dir, max_files=args.max_files, seed=args.seed)
-
-# #     with Timer() as t_total:
-# #         for x, label_clip, src in iterator:
-# #             frames = make_frames(x, fs, args.frame_ms, args.hop_ms)
-# #             T = frames.shape[0]
-# #             decisions = np.zeros(T, dtype=np.int32)
-# #             for i in range(T):
-# #                 decisions[i] = 1 if vad.is_speech(wav_to_int16_bytes(frames[i]), fs) else 0
-# #             decisions = smooth_hangover(decisions, args.hop_ms, args.hangover_ms)
-# #             pred_clip = int(decisions.any())
-
-# #             if label_clip == 1: n_sp += 1
-# #             else:               n_ns += 1
-
-# #             tot_sec_audio += len(x) / fs
-# #             if collect_outputs:
-# #                 rows.append({"source": src, "label": int(label_clip), "pred": pred_clip})
-
-# #     wall = t_total.dt
-# #     hours_audio = tot_sec_audio / 3600.0
-# #     sec_per_hour = (wall / hours_audio) if hours_audio > 0 else float("nan")
-# #     return sec_per_hour, rows, (n_sp, n_ns)
-
-
-# # def main():
-# #     ap = argparse.ArgumentParser(description="WebRTC VAD benchmark.")
-# #     ap.add_argument("--data_dir", required=True)
-# #     ap.add_argument("--aggressiveness", type=int, default=2, choices=[0,1,2,3])
-# #     ap.add_argument("--frame_ms", type=int, default=20, choices=[10,20,30])
-# #     ap.add_argument("--hop_ms", type=int, default=10)
-# #     ap.add_argument("--hangover_ms", type=int, default=200)
-# #     ap.add_argument("--max_files", type=int, default=None)
-# #     ap.add_argument("--seed", type=int, default=0)
-
-# #     ap.add_argument("--out_csv", type=str, default=None)
-
-# #     # timing-only
-# #     ap.add_argument("--timing_only", action="store_true")
-# #     ap.add_argument("--repeat", type=int, default=1)
-# #     ap.add_argument("--no_progress", action="store_true")
-# #     ap.add_argument("--timing_note", type=str, default="")
-
-# #     args = ap.parse_args()
-
-# #     name = model_name(args.aggressiveness)
-
-# #     if args.timing_only:
-# #         secs = []
-# #         for i in range(max(1, args.repeat)):
-# #             s, _, _ = run_once(args, collect_outputs=False)
-# #             secs.append(s)
-# #         secs = np.asarray(secs, dtype=float)
-# #         mean = float(np.mean(secs)); std = float(np.std(secs, ddof=1)) if len(secs)>1 else 0.0
-
-# #         timing_csv = Path("outputs/runtime_timing/runtime_summary.csv")
-# #         timing_csv.parent.mkdir(parents=True, exist_ok=True)
-# #         stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-# #         note = args.timing_note or f"timing_only; repeat={args.repeat}; frame={args.frame_ms} hop={args.hop_ms} hang={args.hangover_ms}"
-# #         hdr = ["model","sec_per_hour","sec_per_hour_mean","sec_per_hour_std","repeats","date","note"]
-# #         row = {"model": name, "sec_per_hour": f"{mean:.2f}",
-# #                "sec_per_hour_mean": f"{mean:.2f}", "sec_per_hour_std": f"{std:.2f}",
-# #                "repeats": int(args.repeat), "date": stamp, "note": note}
-# #         exists = timing_csv.exists()
-# #         with open(timing_csv, "a", newline="", encoding="utf-8") as f:
-# #             w = csv.DictWriter(f, fieldnames=hdr)
-# #             if not exists: w.writeheader()
-# #             w.writerow(row)
-# #         print(f"\n[TIMING-ONLY] {name}: mean={mean:.2f} s/h, std={std:.2f} (N={args.repeat})")
-# #         print(f"[TIMING-ONLY] Logged to {timing_csv}")
-# #         return
-
-# #     # Normal end-to-end
-# #     out_clips = Path(args.out_csv) if args.out_csv else Path(f"outputs/clips/clip_results_{name}.csv")
-# #     out_clips.parent.mkdir(parents=True, exist_ok=True)
-
-# #     s, rows, (n_sp, n_ns) = run_once(args, collect_outputs=True)
-
-# #     # runtime log
-# #     runtime_csv = Path("outputs/runtime/runtime_summary.csv")
-# #     runtime_csv.parent.mkdir(parents=True, exist_ok=True)
-# #     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-# #     hdr = ["model","sec_per_hour","date","note"]
-# #     row = {"model": name, "sec_per_hour": f"{s:.2f}", "date": stamp,
-# #            "note": f"frame={args.frame_ms} hop={args.hop_ms} hang={args.hangover_ms}"}
-# #     exists = runtime_csv.exists()
-# #     with open(runtime_csv, "a", newline="", encoding="utf-8") as f:
-# #         w = csv.DictWriter(f, fieldnames=hdr)
-# #         if not exists: w.writeheader()
-# #         w.writerow(row)
-
-# #     # dataset stats
-# #     dset_csv = Path("outputs/dataset_stats/dataset_summary.csv")
-# #     dset_csv.parent.mkdir(parents=True, exist_ok=True)
-# #     ds_hdr = ["model","num_speech_clips","num_noise_clips","total_frames_speech","total_frames_noise"]
-# #     ds_row = {"model": name, "num_speech_clips": n_sp, "num_noise_clips": n_ns,
-# #               "total_frames_speech": 0, "total_frames_noise": 0}
-# #     exists2 = dset_csv.exists()
-# #     with open(dset_csv, "a", newline="", encoding="utf-8") as f:
-# #         w = csv.DictWriter(f, fieldnames=ds_hdr)
-# #         if not exists2: w.writeheader()
-# #         w.writerow(ds_row)
-
-# #     # clip csv
-# #     with open(out_clips, "w", newline="", encoding="utf-8") as f:
-# #         w = csv.DictWriter(f, fieldnames=["source","label","pred"])
-# #         w.writeheader()
-# #         for r in rows: w.writerow(r)
-
-# #     print(f"\n[{name}] FULL sec/hour: {s:.2f}")
-# #     print(f"[{name}] Wrote clip results → {out_clips}")
-# #     print(f"[{name}] Logged to: {runtime_csv}")
-# #     return
-
-
-# # if __name__ == "__main__":
-# #     main()
-
-
-# #!/usr/bin/env python
-# # scripts/run_vad_webrtc.py
-# # WebRTC VAD (levels 0–3) with optional frame-score export.
-# # Uses vad.datasets.iter_dataset() -> (x, label, source) at 16 kHz.
-
-# import argparse, csv, datetime
-# from pathlib import Path
-# import numpy as np
-# import webrtcvad
-# import sys, os
-
-# sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-# from vad.datasets import iter_dataset
-# from vad.features import frame_signal
-
-# SR = 16000
-
-# def now_tag():
-#     import datetime as _dt
-#     return _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-
-# def safe_scores_path(scores_csv: str | Path, model: str) -> Path:
-#     scores_csv = Path(scores_csv)
-#     tag = now_tag()
-#     if scores_csv.is_dir() or str(scores_csv).endswith(os.sep):
-#         scores_csv.mkdir(parents=True, exist_ok=True)
-#         return scores_csv / f"frame_scores_{model}_{tag}.csv"
-#     scores_csv.parent.mkdir(parents=True, exist_ok=True)
-#     if scores_csv.exists():
-#         stem, suf = scores_csv.stem, scores_csv.suffix
-#         return scores_csv.with_name(f"{stem}_{model}_{tag}{suf or '.csv'}")
-#     if "frame_scores" in scores_csv.name and model not in scores_csv.name:
-#         stem, suf = scores_csv.stem, scores_csv.suffix
-#         return scores_csv.with_name(f"{stem}_{model}_{tag}{suf or '.csv'}")
-#     return scores_csv
-
-# def wav_to_int16_bytes(x: np.ndarray) -> bytes:
-#     x = np.clip(x, -1.0, 1.0)
-#     x = (x * 32767.0).astype(np.int16)
-#     return x.tobytes()
-
-# def main():
-#     ap = argparse.ArgumentParser(description="Run WebRTC VAD (levels 0–3)")
-#     ap.add_argument("--dataset_root", type=str, required=True)
-#     ap.add_argument("--level", type=int, default=2, choices=[0,1,2,3], help="Aggressiveness")
-#     ap.add_argument("--frame_ms", type=int, default=20, choices=[10,20,30])
-#     ap.add_argument("--hop_ms", type=int, default=10)
-#     ap.add_argument("--out_csv", type=str, default="outputs/clips/clip_results_webrtc_l2.csv")
-#     ap.add_argument("--emit_scores", action="store_true")
-#     ap.add_argument("--scores_csv", type=str, default="outputs/frames/")
-#     args = ap.parse_args()
-
-#     vad = webrtcvad.Vad(args.level)
-#     model = f"webrtc_l{args.level}"
-
-#     score_writer = None
-#     score_file = None
-#     if args.emit_scores:
-#         score_path = safe_scores_path(args.scores_csv, model)
-#         score_file = open(score_path, "w", newline="", encoding="utf-8")
-#         score_writer = csv.DictWriter(
-#             score_file,
-#             fieldnames=["model","source","frame_idx","label_frame","score","prob"]
-#         )
-#         score_writer.writeheader()
-#         print(f"[scores] writing frame scores to: {score_path}")
-
-#     rows = []
-#     for x, label_clip, source in iter_dataset(args.dataset_root):
-#         frames = frame_signal(x, SR, frame_ms=float(args.frame_ms), hop_ms=float(args.hop_ms))
-#         # WebRTC expects exact 10/20/30 ms buffers @16k
-#         # We’ll decide per frame, then clip is speech if any frame is speech.
-#         frame_dec = []
-#         for i, fr in enumerate(frames):
-#             pcm = wav_to_int16_bytes(fr)
-#             is_speech = 1 if vad.is_speech(pcm, SR) else 0
-#             frame_dec.append(is_speech)
-#             if score_writer is not None:
-#                 score_writer.writerow({
-#                     "model": model,
-#                     "source": source,
-#                     "frame_idx": i,
-#                     "label_frame": int(label_clip),
-#                     "score": float(is_speech),  # binary "score" (for plotting as points)
-#                     "prob": float(is_speech)
-#                 })
-#         frame_dec = np.asarray(frame_dec, dtype=np.int32)
-#         clip_pred = int(frame_dec.max() > 0)
-#         rows.append({"source": source, "label": int(label_clip), "pred": clip_pred})
-
-#     Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
-#     with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
-#         w = csv.DictWriter(f, fieldnames=["source","label","pred"])
-#         w.writeheader()
-#         for r in rows:
-#             w.writerow(r)
-#     print(f"\nSaved per-clip results to: {args.out_csv}")
-
-#     if score_writer is not None:
-#         score_file.close()
-#         print(f"Saved per-frame scores with model='{model}'.")
-#         print("Note: WebRTC exports binary scores; curves will show as isolated points.")
-# if __name__ == "__main__":
-#     main()
-
-
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # scripts/run_vad_webrtc.py
-import argparse, csv, datetime, os, sys
+# Run WebRTC VAD (levels 2/3) with unified outputs + frame CSVs for ROC/PR.
+
+import argparse, csv, time, datetime, os, sys
 from pathlib import Path
 import numpy as np
 import webrtcvad
 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+# ensure local 'vad' import
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from vad.datasets import iter_dataset
 from vad.features import frame_signal
 
-SR = 16000
+NOISE_DIR_NAMES = {"_background_noise_", "noise", "silence"}
+
+def coerce_sample_to_tuple4(sample):
+    if isinstance(sample, (tuple, list)) and len(sample) == 4:
+        source, x, fs, label = sample
+        return str(source), np.asarray(x, dtype=np.float32), int(fs), int(label)
+    if isinstance(sample, (tuple, list)) and len(sample) == 3:
+        a, b, c = sample
+        if isinstance(a, (str, Path)) and not isinstance(b, (str, Path)) and not isinstance(c, (str, Path)):
+            source, x, fs = a, b, c
+        elif not isinstance(a, (str, Path)) and not isinstance(b, (str, Path)) and isinstance(c, (str, Path)):
+            x, fs, source = a, b, c
+        else:
+            raise ValueError(f"Unrecognized 3-tuple format from dataset: types={[type(v) for v in sample]}")
+        source = str(source)
+        x = np.asarray(x, dtype=np.float32)
+        fs = int(fs)
+        parent = Path(source).parent.name.lower()
+        label = 0 if parent in NOISE_DIR_NAMES else 1
+        return source, x, fs, label
+    raise ValueError("Unsupported dataset sample format.")
 
 def now_tag():
-    import datetime as _dt
-    return _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
-def safe_scores_path(scores_csv: str | Path, model: str) -> Path:
-    scores_csv = Path(scores_csv)
-    tag = now_tag()
-    if scores_csv.is_dir() or str(scores_csv).endswith(os.sep):
-        scores_csv.mkdir(parents=True, exist_ok=True)
-        return scores_csv / f"frame_scores_{model}_{tag}.csv"
-    scores_csv.parent.mkdir(parents=True, exist_ok=True)
-    if scores_csv.exists():
-        stem, suf = scores_csv.stem, scores_csv.suffix
-        return scores_csv.with_name(f"{stem}_{model}_{tag}{suf or '.csv'}")
-    if "frame_scores" in scores_csv.name and model not in scores_csv.name:
-        stem, suf = scores_csv.stem, scores_csv.suffix
-        return scores_csv.with_name(f"{stem}_{model}_{tag}{suf or '.csv'}")
-    return scores_csv
+def ensure_dirs(tag: str, model: str):
+    clips_dir  = Path("outputs/clips")  / tag
+    frames_dir = Path("outputs/frames") / tag / model
+    runtime_dir= Path("outputs/runtime")/ tag
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return clips_dir, frames_dir, runtime_dir
 
-def wav_to_int16_bytes(x: np.ndarray) -> bytes:
+def _pcm16(x):
     x = np.clip(x, -1.0, 1.0)
-    x = (x * 32767.0).astype(np.int16)
-    return x.tobytes()
+    return (x * 32767.0).astype(np.int16).tobytes()
 
-def median3(x):
-    if len(x) < 3: return x.copy()
-    y = x.copy(); y[1:-1] = ((x[:-2]+x[1:-1]+x[2:])>=2).astype(np.int32); return y
-def apply_hangover(x, n):
-    if n <= 0 or len(x)==0: return x
-    y=x.copy(); last_on=-10**9
+def median3(x: np.ndarray) -> np.ndarray:
+    if len(x) < 3: return x.astype(np.int32, copy=True)
+    y = x.astype(np.int32, copy=True)
+    y[1:-1] = ((x[:-2] + x[1:-1] + x[2:]) >= 2).astype(np.int32)
+    return y
+
+def apply_hangover(x: np.ndarray, n: int) -> np.ndarray:
+    if n <= 0 or len(x) == 0: return x.astype(np.int32, copy=True)
+    y = x.astype(np.int32, copy=True)
+    last_on = -10**9
     for i in range(len(y)):
-        if y[i]==1: last_on=i
-        elif i-last_on<=n: y[i]=1
+        if y[i] == 1:
+            last_on = i
+        elif i - last_on <= n:
+            y[i] = 1
     return y
 
 def main():
-    ap = argparse.ArgumentParser(description="Run WebRTC VAD (levels 0–3)")
-    ap.add_argument("--dataset_root", type=str, required=True)
-    ap.add_argument("--level", type=int, default=2, choices=[0,1,2,3])
-    ap.add_argument("--frame_ms", type=int, default=20, choices=[10,20,30])
-    ap.add_argument("--hop_ms", type=int, default=10)
-    ap.add_argument("--out_csv", type=str, default="outputs/clips/clip_results_webrtc_l2.csv")
-    ap.add_argument("--emit_scores", action="store_true")
-    ap.add_argument("--scores_csv", type=str, default="outputs/frames/")
+    p = argparse.ArgumentParser(description="Run WebRTC VAD")
+    p.add_argument("--dataset_root", required=True)
+    p.add_argument("--level", type=int, choices=[2,3], required=True)
+    p.add_argument("--tag", type=str, required=True)
+    p.add_argument("--frame_ms", type=int, default=30, help="WebRTC supported: 10/20/30 ms")
+    p.add_argument("--hop_ms", type=int, default=10, help="step")
+    p.add_argument("--emit_scores", action="store_true")
+    p.add_argument("--repeat", type=int, default=1)
+    p.add_argument("--timing_note", type=str, default="")
+    # clip policy parity
+    p.add_argument("--median3", action="store_true")
+    p.add_argument("--hangover_ms", type=int, default=0)
+    p.add_argument("--min_speech_frames", type=int, default=1)
+    args = p.parse_args()
 
-    # NEW clip policy
-    ap.add_argument("--median3", action="store_true")
-    ap.add_argument("--hangover_frames", type=int, default=0)
-    ap.add_argument("--min_speech_frames", type=int, default=1)
-    args = ap.parse_args()
+    stamp = now_tag()
+    model = f"webrtc_l{args.level}"
+    clips_dir, frames_dir, runtime_dir = ensure_dirs(args.tag, model)
 
     vad = webrtcvad.Vad(args.level)
-    model = f"webrtc_l{args.level}"
+    clip_path = clips_dir / f"clip_results_{model}_{args.tag}.csv"
+    cw = csv.DictWriter(open(clip_path, "w", newline="", encoding="utf-8"),
+                        fieldnames=["source","label","pred"])
+    cw.writeheader()
 
-    score_writer = None; score_file = None
+    sw = None
     if args.emit_scores:
-        score_path = safe_scores_path(args.scores_csv, model)
-        score_file = open(score_path, "w", newline="", encoding="utf-8")
-        score_writer = csv.DictWriter(
-            score_file,
-            fieldnames=["model","source","frame_idx","label_frame","score","prob"]
-        )
-        score_writer.writeheader()
-        print(f"[scores] writing frame scores to: {score_path}")
+        frame_path = frames_dir / f"frame_scores_{model}_{args.tag}.csv"
+        sw = csv.DictWriter(open(frame_path, "w", newline="", encoding="utf-8"),
+                            fieldnames=["model","source","frame_idx","label_frame","score","prob"])
+        sw.writeheader()
+        print(f"[scores] writing frame scores to: {frame_path}")
 
-    rows = []
-    for x, label_clip, source in iter_dataset(args.dataset_root):
-        frames = frame_signal(x, SR, frame_ms=float(args.frame_ms), hop_ms=float(args.hop_ms))
-        dec = []
-        for i, fr in enumerate(frames):
-            is_speech = 1 if vad.is_speech(wav_to_int16_bytes(fr), SR) else 0
-            dec.append(is_speech)
-            if score_writer is not None:
-                score_writer.writerow({
-                    "model": model, "source": source, "frame_idx": i,
-                    "label_frame": int(label_clip), "score": float(is_speech), "prob": float(is_speech)
-                })
-        dec = np.asarray(dec, dtype=np.int32)
-        if args.median3: dec = median3(dec)
-        if args.hangover_frames > 0: dec = apply_hangover(dec, args.hangover_frames)
-        clip_pred = int(np.sum(dec) >= args.min_speech_frames)
-        rows.append({"source": source, "label": int(label_clip), "pred": clip_pred})
+    total_audio_sec = 0.0
+    wall = []
 
-    Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["source","label","pred"])
-        w.writeheader(); w.writerows(rows)
-    print(f"\nSaved per-clip results to: {args.out_csv}")
+    fps = 1000.0 / args.hop_ms
+    hang_frames = max(0, int(round(args.hangover_ms / (1000.0 / fps))))
 
-    if score_writer is not None:
-        score_file.close()
-        print(f"Saved per-frame scores with model='{model}'. (scores unchanged by clip policy)")
+    for r in range(max(1, args.repeat)):
+        t0 = time.time()
+        for sample in iter_dataset(args.dataset_root):
+            source, x, fs, label_clip = coerce_sample_to_tuple4(sample)
+
+            # framing
+            try:
+                fr = frame_signal(x, fs, frame_ms=float(args.frame_ms), hop_ms=float(args.hop_ms))
+            except Exception:
+                fs = 16000
+                fr = frame_signal(x, fs, frame_ms=float(args.frame_ms), hop_ms=float(args.hop_ms))
+
+            pred_frames = np.zeros(len(fr), dtype=np.int32)
+            for i in range(len(fr)):
+                ok = vad.is_speech(_pcm16(fr[i]), sample_rate=fs)
+                pred_frames[i] = int(ok)
+                if sw is not None:
+                    sw.writerow({
+                        "model": model,
+                        "source": source,
+                        "frame_idx": i,
+                        "label_frame": int(pred_frames[i]),  # OP overlay reference
+                        "score": float(pred_frames[i]),
+                        "prob": float(pred_frames[i]),
+                    })
+
+            if args.median3:
+                pred_frames = median3(pred_frames)
+            if hang_frames > 0:
+                pred_frames = apply_hangover(pred_frames, hang_frames)
+
+            pred_clip = int(np.sum(pred_frames) >= int(args.min_speech_frames))
+            cw.writerow({"source": source, "label": int(label_clip), "pred": pred_clip})
+
+            total_audio_sec += len(x) / fs
+        wall.append(time.time() - t0)
+
+    # runtime logs
+    audio_hours = total_audio_sec / 3600.0
+    spH = [(w / audio_hours) if audio_hours > 0 else 0.0 for w in wall]
+    mean_spH = float(np.mean(spH)) if spH else 0.0
+    std_spH  = float(np.std(spH, ddof=1)) if len(spH) > 1 else 0.0
+
+    per_model_timing = runtime_dir / f"timing_{model}_{stamp}.csv"
+    with open(per_model_timing, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["model","repeat","wall_time_sec","sec_per_hour_run","audio_hours","date","note"])
+        w.writeheader()
+        for i, (wt, sph) in enumerate(zip(wall, spH), start=1):
+            w.writerow({
+                "model": model,
+                "repeat": i,
+                "wall_time_sec": round(wt, 4),
+                "sec_per_hour_run": round(sph, 4),
+                "audio_hours": round(audio_hours, 6),
+                "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "note": args.timing_note,
+            })
+
+    summary_path = runtime_dir / f"runtime_summary_{args.tag}__{stamp}.csv"
+    write_header = not summary_path.exists()
+    with open(summary_path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "model","sec_per_hour","sec_per_hour_mean","sec_per_hour_std",
+            "repeats","date","note"
+        ])
+        if write_header:
+            w.writeheader()
+        w.writerow({
+            "model": model,
+            "sec_per_hour": round(spH[-1], 4) if spH else "",
+            "sec_per_hour_mean": round(mean_spH, 4),
+            "sec_per_hour_std": round(std_spH, 4),
+            "repeats": len(wall),
+            "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "note": args.timing_note,
+        })
+
+    print(f"[clips]  {clip_path}")
+    if sw is not None:
+        print(f"[frames] {frames_dir}/*.csv")
+    print(f"[runtime] {summary_path}")
+
 if __name__ == "__main__":
     main()

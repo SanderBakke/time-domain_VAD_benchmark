@@ -20,6 +20,9 @@ build/
 
 # ---- Project-specific (DON'T COMMIT DATA OR OUTPUTS)
 data/
+data_aug/
+data_aug_heavy/
+data_aug_light/
 outputs/
 !outputs/.gitkeep
 
