@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
-augment_subset.py
-Create a small augmented subset of a Speech Commands–style dataset for realistic VAD benchmarking.
+vad_subset_parallel.py
 
-What it does (and why):
-- Picks a subset of speech files + splits noise into 1s clips (balances classes; faster iteration).
-- Applies realistic augmentations: gain, SNR mixing, time shift, short reverb, safe band-limiting.
-- Presets (--preset light|heavy|custom) control augmentation strength and probabilities.
-- Saves augmented WAVs into <out>/{speech,noise} and logs manifest.csv + config.json (reproducibility).
-- Plots histograms for SNR and gain to verify augmentation distributions.
-- Uses numerically-stable SOS filters with safe cutoffs (fixes "0 < Wn < 1" SciPy errors).
+Create paired VAD test subsets (none / light / heavy) from Speech Commands–style data.
+Designed for fair comparison of time-domain and frequency-domain VADs.
 
-Usage (defaults okay):
-    python scripts/augment_subset.py
-or with options/presets:
-    python scripts/augment_subset.py --preset light --out data_aug_light --n_speech 4000 --n_noise 4000
-    python scripts/augment_subset.py --preset heavy --out data_aug_heavy --n_speech 4000 --n_noise 4000
+Key properties:
+- One canonical base selection (speech + noise)
+- Multiple augmentation presets applied in parallel
+- Identical clips across presets (paired testing)
+- No peak normalization (clip-guard only)
+- No transient emphasis
+- Visual diagnostics for augmentation realism
 """
 
 import argparse
@@ -27,425 +23,293 @@ import warnings
 
 import numpy as np
 import matplotlib.pyplot as plt
-
-try:
-    import librosa
-except ImportError as e:
-    raise ImportError(
-        "librosa is not installed. Run inside your venv:\n"
-        "    python -m pip install librosa soundfile scipy matplotlib\n"
-    )
-
+import librosa
 import soundfile as sf
 import scipy.signal as sig
 
 
-# ----------------------- Helpers -----------------------
+# =========================
+# Basic utilities
+# =========================
 
-def rms(x: np.ndarray) -> float:
+def rms(x):
     return float(np.sqrt(np.mean(x ** 2) + 1e-12))
 
-def normalize_length(x: np.ndarray, target_len: int) -> np.ndarray:
+
+def normalize_length(x, target_len):
     if len(x) > target_len:
         return x[:target_len]
     if len(x) < target_len:
-        return np.pad(x, (0, target_len - len(x)), mode="constant")
+        return np.pad(x, (0, target_len - len(x)))
     return x
 
-def apply_gain(x: np.ndarray, gain_db: float) -> np.ndarray:
+
+def apply_gain(x, gain_db):
     return x * (10.0 ** (gain_db / 20.0))
 
-def _safe_norm(freq_hz: float, sr: int, eps: float = 1e-6) -> float:
-    """Normalize frequency to (0,1) for digital filters; clamp away from 0 and Nyquist."""
-    nyq = sr / 2.0
-    f = max(eps, min(float(freq_hz), nyq - eps))
-    return f / nyq
 
-def _butter_sos(order: int, wn, btype: str):
-    """Stable SOS butterworth helper."""
-    return sig.butter(order, wn, btype=btype, output="sos")
+def clip_guard(x, limit=0.99):
+    peak = np.max(np.abs(x))
+    if peak > limit:
+        x = x * (limit / peak)
+    return x
 
-def random_bandlimit(x: np.ndarray, sr: int, p_conf: dict) -> np.ndarray:
-    """
-    Random simple coloration with safe cutoffs and SOS filtering:
-      - bp_prob: band-pass in a speechy band
-      - hp_prob: high-pass (remove lows)
-      - lp_prob: low-pass (remove highs)
-    """
-    r = random.random()
-    bp_prob = p_conf["bp_prob"]
-    hp_prob = p_conf["hp_prob"]
-    # lp_prob is implicitly 1 - bp_prob - hp_prob
-    nyq = sr / 2.0
 
-    if r < bp_prob:
-        # Band-pass: either phone band or a randomized band
-        if random.random() < 0.5:
-            low_hz, high_hz = 300.0, min(3400.0, nyq - 50.0)
-        else:
-            low_hz = random.uniform(150.0, 1200.0)
-            high_hz = random.uniform(max(low_hz + 200.0, 1200.0), nyq - 50.0)
-        wn = (_safe_norm(low_hz, sr), _safe_norm(high_hz, sr))
-        sos = _butter_sos(4, wn, btype="bandpass")
-        return sig.sosfiltfilt(sos, x)
-
-    elif r < bp_prob + hp_prob:
-        # High-pass
-        cut_hz = random.uniform(p_conf["hp_min"], p_conf["hp_max"])
-        wn = _safe_norm(cut_hz, sr)
-        sos = _butter_sos(4, wn, btype="highpass")
-        return sig.sosfiltfilt(sos, x)
-
-    else:
-        # Low-pass
-        cut_hz = random.uniform(p_conf["lp_min"], nyq - 200.0)  # margin from Nyquist
-        wn = _safe_norm(cut_hz, sr)
-        sos = _butter_sos(4, wn, btype="lowpass")
-        return sig.sosfiltfilt(sos, x)
-
-def apply_reverb(x: np.ndarray, sr: int, t60_range=(0.2, 0.4)) -> np.ndarray:
-    """Short 'roomy' reverb via exponential IR; normalized safely to avoid div-zero."""
-    decay = random.uniform(*t60_range)        # seconds
-    ir_len = max(8, int(sr * decay))
-    ir = np.exp(-np.linspace(0, 3, ir_len))
-    mx = float(np.max(np.abs(ir)))
-    if mx > 0:
-        ir = ir / mx
-    y = sig.fftconvolve(x, ir)[:len(x)]
-    my = float(np.max(np.abs(y)))
-    if my > 0:
-        y = y / my
-    return y
-
-def shift_signal(x: np.ndarray, sr: int, max_shift_ms: float):
-    """Zero-padded shift to keep length constant."""
-    max_shift = int((max_shift_ms / 1000.0) * sr)
+def shift_signal(x, sr, max_shift_ms):
+    max_shift = int(sr * max_shift_ms / 1000)
     if max_shift <= 0:
         return x, 0
     shift = random.randint(-max_shift, max_shift)
     if shift > 0:
-        x = np.pad(x, (shift, 0), mode="constant")[:len(x)]
+        x = np.pad(x, (shift, 0))[:len(x)]
     elif shift < 0:
-        x = np.pad(x, (0, -shift), mode="constant")[-shift:]
+        x = np.pad(x, (0, -shift))[-shift:]
     return x, shift
 
-def mix_with_noise_multi(speech: np.ndarray, noises: list[np.ndarray], snr_db: float) -> np.ndarray:
-    """
-    Mix one or more noise tracks to reach target SNR wrt speech RMS.
-    1) Sum noises -> combined noise
-    2) Scale combined noise to achieve desired SNR
-    3) Add and peak-normalize
-    """
-    sp = speech
-    ns = np.zeros_like(speech)
-    for n in noises:
-        ns = ns + n[:len(ns)]
-    sp_rms = rms(sp)
-    ns_rms = rms(ns)
-    if ns_rms == 0.0:
-        y = sp
+
+# =========================
+# Filtering / reverb
+# =========================
+
+def _safe_norm(freq, sr):
+    nyq = sr / 2
+    return max(1e-4, min(freq, nyq - 1e-4)) / nyq
+
+
+def butter_sos(order, wn, btype):
+    return sig.butter(order, wn, btype=btype, output="sos")
+
+
+def random_bandlimit(x, sr, cfg):
+    r = random.random()
+    if r < cfg["bp_prob"]:
+        lo = random.uniform(200, 800)
+        hi = random.uniform(max(lo + 300, 1200), sr / 2 - 200)
+        sos = butter_sos(4, (_safe_norm(lo, sr), _safe_norm(hi, sr)), "bandpass")
+    elif r < cfg["bp_prob"] + cfg["hp_prob"]:
+        cut = random.uniform(cfg["hp_min"], cfg["hp_max"])
+        sos = butter_sos(4, _safe_norm(cut, sr), "highpass")
     else:
-        desired_ns_rms = sp_rms / (10.0 ** (snr_db / 20.0))
-        scale = desired_ns_rms / ns_rms
-        ns_scaled = ns * scale
-        y = sp + ns_scaled
-    peak = float(np.max(np.abs(y)))
-    if peak > 0:
-        y = y / peak
-    return y
-
-def load_audio(path: Path, sr: int) -> np.ndarray:
-    y, _ = librosa.load(str(path), sr=sr)
-    return y.astype(np.float32, copy=False)
-
-def load_random_noise(noise_seg_files, sr: int, target_len: int) -> np.ndarray:
-    nfile = random.choice(noise_seg_files)
-    n = load_audio(nfile, sr)
-    return normalize_length(n, target_len)
-
-def get_speech_files(root: Path, classes):
-    files = []
-    for c in classes:
-        folder = root / c
-        if folder.exists():
-            files += list(folder.glob("*.wav"))
-    return files
-
-def get_noise_files(root: Path):
-    folder = root / "_background_noise_"
-    if not folder.exists():
-        return []
-    return list(folder.glob("*.wav"))
-
-def split_noise_to_one_sec(noise_files, out_dir: Path, sr: int, target_len: int):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    segs = []
-    for nf in noise_files:
-        x = load_audio(nf, sr)
-        nseg = len(x) // target_len
-        for i in range(nseg):
-            seg = x[i*target_len:(i+1)*target_len]
-            seg_file = out_dir / f"{nf.stem}_{i:03d}.wav"
-            sf.write(seg_file, seg, sr)
-            segs.append(seg_file)
-    return segs
+        cut = random.uniform(cfg["lp_min"], sr / 2 - 200)
+        sos = butter_sos(4, _safe_norm(cut, sr), "lowpass")
+    return sig.sosfiltfilt(sos, x)
 
 
-# ----------------------- Preset configuration -----------------------
+def apply_reverb(x, sr, t60_range):
+    t60 = random.uniform(*t60_range)
+    ir_len = int(sr * t60)
+    ir = np.exp(-np.linspace(0, 3, ir_len))
+    ir /= np.max(np.abs(ir))
+    y = sig.fftconvolve(x, ir)[:len(x)]
+    return y / max(1e-6, np.max(np.abs(y)))
 
-def preset_config(name: str) -> dict:
-    """
-    Returns a dictionary with augmentation strengths/probabilities.
-    - 'light'  : mild, realistic phone/mic variability
-    - 'heavy'  : stress test in noisy/colored conditions
-    - 'custom' : baseline close to your previous script ("medium-heavy")
-    """
+
+# =========================
+# Mixing
+# =========================
+
+def mix_with_noise(speech, noise, snr_db):
+    sp_rms = rms(speech)
+    ns_rms = rms(noise)
+    if ns_rms == 0:
+        return speech
+    desired_ns_rms = sp_rms / (10 ** (snr_db / 20))
+    noise = noise * (desired_ns_rms / ns_rms)
+    return speech + noise
+
+
+# =========================
+# Presets
+# =========================
+
+def preset_cfg(name):
+    if name == "none":
+        return dict(
+            snr=None,
+            gain_s=(0, 0),
+            gain_n=(0, 0),
+            shift=0,
+            rev_p_s=0,
+            rev_p_n=0,
+            bl_p_s=0,
+            bl_p_n=0,
+        )
     if name == "light":
-        return {
-            "snr_choices": [0, 3, 5, 8, 10],
-            "gain_speech_db": (-6, 6),
-            "gain_noise_db": (-4, 4),
-            "shift_ms_max": 100.0,
-            "reverb_prob_speech": 0.20,
-            "reverb_prob_noise": 0.15,
-            "bandlimit_prob_speech": 0.20,
-            "bandlimit_prob_noise": 0.20,
-            "bp_prob": 0.35, "hp_prob": 0.35, "lp_min": 2200.0, "hp_min": 100.0, "hp_max": 300.0,
-            "t60_range": (0.18, 0.30),
-            "double_noise_prob": 0.0,   # single noise layer
-        }
+        return dict(
+            snr=[0, 3, 5, 8, 10],
+            gain_s=(-6, 6),
+            gain_n=(-4, 4),
+            shift=100,
+            rev_p_s=0.2,
+            rev_p_n=0.15,
+            bl_p_s=0.2,
+            bl_p_n=0.2,
+        )
     if name == "heavy":
-        return {
-            "snr_choices": [-10, -7, -5, -3, 0, 3],
-            "gain_speech_db": (-12, 12),
-            "gain_noise_db": (-8, 8),
-            "shift_ms_max": 200.0,
-            "reverb_prob_speech": 0.40,
-            "reverb_prob_noise": 0.30,
-            "bandlimit_prob_speech": 0.40,
-            "bandlimit_prob_noise": 0.40,
-            "bp_prob": 0.40, "hp_prob": 0.30, "lp_min": 1800.0, "hp_min": 80.0, "hp_max": 400.0,
-            "t60_range": (0.25, 0.40),
-            "double_noise_prob": 0.35,  # sometimes add a 2nd noise layer
-        }
-    # custom = your previous defaults ("medium-heavy")
-    return {
-        "snr_choices": [-10, -5, 0, 5, 10],
-        "gain_speech_db": (-12, 12),
-        "gain_noise_db": (-6, 6),
-        "shift_ms_max": 200.0,
-        "reverb_prob_speech": 0.30,
-        "reverb_prob_noise": 0.20,
-        "bandlimit_prob_speech": 0.30,
-        "bandlimit_prob_noise": 0.30,
-        "bp_prob": 0.40, "hp_prob": 0.30, "lp_min": 2500.0, "hp_min": 80.0, "hp_max": 400.0,
-        "t60_range": (0.20, 0.40),
-        "double_noise_prob": 0.0,
-    }
+        return dict(
+            snr=[-10, -7, -5, -3, 0, 3],
+            gain_s=(-12, 12),
+            gain_n=(-8, 8),
+            shift=200,
+            rev_p_s=0.4,
+            rev_p_n=0.3,
+            bl_p_s=0.4,
+            bl_p_n=0.4,
+        )
+    raise ValueError(name)
 
 
-# ----------------------- Main -----------------------
+# =========================
+# Main
+# =========================
 
 def main():
-    parser = argparse.ArgumentParser(description="Augment a small, realistic subset for VAD benchmarking.")
-    parser.add_argument("--src", type=str, default="data", help="Source dataset root")
-    parser.add_argument("--out", type=str, default=None, help="Output root for augmented data (default depends on preset)")
-    parser.add_argument("--sr", type=int, default=16000, help="Sample rate")
-    parser.add_argument("--n_speech", type=int, default=5000, help="Number of speech clips to augment")
-    parser.add_argument("--n_noise", type=int, default=5000, help="Number of 1s noise clips to generate")
-    parser.add_argument("--classes", type=str, nargs="*", default=[
-        "bed","bird","cat","dog","down","eight","five","go"
-    ], help="Speech classes to include in subset")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--preset", type=str, default="custom", choices=["light","heavy","custom"],
-                        help="Augmentation strength preset")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--src", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--sr", type=int, default=16000)
+    ap.add_argument("--n_speech", type=int, default=7500)
+    ap.add_argument("--n_noise", type=int, default=7500)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--presets", nargs="+", default=["none", "light", "heavy"])
+    ap.add_argument("--classes", nargs="+", default=None)
+    args = ap.parse_args()
 
-    # RNG seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    # Config from preset
-    cfg = preset_config(args.preset)
+    SR = args.sr
+    L = SR
 
-    SRC_ROOT = Path(args.src)
-    # If --out omitted, choose default name by preset
-    if args.out is None:
-        OUT_ROOT = Path(f"data_aug_{args.preset}")
+    src = Path(args.src)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # -------- base selection --------
+    speech_files = []
+    for d in src.iterdir():
+        if d.is_dir() and d.name != "_background_noise_":
+            if args.classes is None or d.name in args.classes:
+                speech_files += list(d.glob("*.wav"))
+
+    noise_src = list((src / "_background_noise_").glob("*.wav"))
+
+    assert speech_files and noise_src
+
+    speech_sel = random.sample(speech_files, args.n_speech)
+
+    noise_segments = []
+    for nf in noise_src:
+        y, _ = librosa.load(nf, sr=SR)
+        for i in range(len(y) // L):
+            noise_segments.append((nf.name, y[i * L:(i + 1) * L]))
+
+    if args.n_noise <= len(noise_segments):
+        noise_sel = random.sample(noise_segments, args.n_noise)
     else:
-        OUT_ROOT = Path(args.out)
-    SR = int(args.sr)
-    TARGET_LEN = SR * 1  # 1 second
+        noise_sel = [random.choice(noise_segments) for _ in range(args.n_noise)]
 
-    # Output dirs
-    (OUT_ROOT / "speech").mkdir(parents=True, exist_ok=True)
-    (OUT_ROOT / "noise").mkdir(parents=True, exist_ok=True)
-
-    # Save config snapshot for reproducibility
-    cfg_snapshot = {
-        "preset": args.preset,
+    base_index = {
+        "speech": [str(p) for p in speech_sel],
+        "noise": [f"{n[0]}::{i}" for i, n in enumerate(noise_sel)],
         "seed": args.seed,
-        "sr": SR,
-        "n_speech": args.n_speech,
-        "n_noise": args.n_noise,
-        "classes": args.classes,
-        "params": cfg
     }
-    with open(OUT_ROOT / "config.json", "w", encoding="utf-8") as f:
-        json.dump(cfg_snapshot, f, indent=2)
+    with open(out / "base_selection.json", "w") as f:
+        json.dump(base_index, f, indent=2)
 
-    # Manifest CSV
-    manifest_path = OUT_ROOT / "manifest.csv"
-    mf = open(manifest_path, "w", newline="", encoding="utf-8")
-    writer = csv.DictWriter(mf, fieldnames=[
-        "outfile","source","class","gain_db","snr_db","shift_ms","reverb","bandlimit","preset"
-    ])
-    writer.writeheader()
+    # -------- generate presets --------
+    for preset in args.presets:
+        cfg = preset_cfg(preset)
+        pdir = out / preset
+        (pdir / "speech").mkdir(parents=True, exist_ok=True)
+        (pdir / "noise").mkdir(parents=True, exist_ok=True)
+        (pdir / "plots").mkdir(parents=True, exist_ok=True)
 
-    # Discover files
-    speech_files = get_speech_files(SRC_ROOT, args.classes)
-    noise_files = get_noise_files(SRC_ROOT)
-    print(f"Found {len(speech_files)} speech, {len(noise_files)} noise source files")
-    if len(noise_files) == 0:
-        print("[warn] No files under '_background_noise_'. You can still run, but 'mix_with_noise' will fail.")
-        print("       Please add noise WAVs into SRC/_background_noise_/")
+        snrs, gains, rms_s, rms_n = [], [], [], []
 
-    # Split noise into 1s segments
-    split_noise_dir = OUT_ROOT / "noise_split"
-    all_noise_segments = split_noise_to_one_sec(noise_files, split_noise_dir, SR, TARGET_LEN)
-    print(f"Split noise into {len(all_noise_segments)} 1s segments")
+        with open(pdir / "manifest.csv", "w", newline="") as mf:
+            wr = csv.writer(mf)
+            wr.writerow(["id", "type", "preset", "snr_db", "gain_db", "shift"])
 
-    # Choose subsets
-    n_speech = min(args.n_speech, len(speech_files))
-    chosen_speech = random.sample(speech_files, n_speech)
+            # speech
+            for i, sfp in enumerate(speech_sel):
+                x, _ = librosa.load(sfp, sr=SR)
+                x = normalize_length(x, L)
 
-    if args.n_noise <= len(all_noise_segments):
-        chosen_noise = random.sample(all_noise_segments, args.n_noise)
-    else:
-        # sample with replacement to reach requested count
-        chosen_noise = [random.choice(all_noise_segments) for _ in range(args.n_noise)]
+                g = random.uniform(*cfg["gain_s"])
+                x = apply_gain(x, g)
 
-    # Tracking for histograms
-    snr_values, gain_values = [], []
+                if cfg["shift"] > 0:
+                    x, sh = shift_signal(x, SR, cfg["shift"])
+                else:
+                    sh = 0
 
-    # Bandlimit sub-config for filters
-    bl_conf = dict(
-        bp_prob=cfg["bp_prob"], hp_prob=cfg["hp_prob"],
-        lp_min=cfg["lp_min"], hp_min=cfg["hp_min"], hp_max=cfg["hp_max"]
-    )
+                if random.random() < cfg["rev_p_s"]:
+                    x = apply_reverb(x, SR, (0.2, 0.4))
 
-    # --- Augment speech ---
-    for sfile in chosen_speech:
-        x = load_audio(sfile, SR)
-        x = normalize_length(x, TARGET_LEN)
+                if random.random() < cfg["bl_p_s"]:
+                    x = random_bandlimit(x, SR, dict(
+                        bp_prob=0.4, hp_prob=0.3, lp_min=2000, hp_min=80, hp_max=400
+                    ))
 
-        # Gain
-        g_lo, g_hi = cfg["gain_speech_db"]
-        gain_db = random.uniform(g_lo, g_hi)
-        x = apply_gain(x, gain_db)
-        gain_values.append(gain_db)
+                if cfg["snr"] is not None:
+                    snr = random.choice(cfg["snr"])
+                    nsrc, n = noise_sel[i % len(noise_sel)]
+                    y = mix_with_noise(x, n, snr)
+                    snrs.append(snr)
+                else:
+                    y = x
+                    snr = ""
 
-        # Shift
-        shift_ms = 0.0
-        if cfg["shift_ms_max"] > 0 and random.random() < 0.5:
-            x, shift = shift_signal(x, SR, cfg["shift_ms_max"])
-            shift_ms = 1000.0 * shift / SR
+                y = clip_guard(y)
 
-        # Reverb
-        reverb_used = False
-        if random.random() < cfg["reverb_prob_speech"]:
-            x = apply_reverb(x, SR, t60_range=cfg["t60_range"])
-            reverb_used = True
+                sf.write(pdir / "speech" / f"speech_{i:05d}.wav", y, SR)
+                wr.writerow([i, "speech", preset, snr, g, sh])
 
-        # Band-limit
-        band_used = False
-        if random.random() < cfg["bandlimit_prob_speech"]:
-            x = random_bandlimit(x, SR, bl_conf)
-            band_used = True
+                gains.append(g)
+                rms_s.append(rms(y))
 
-        # Mix with 1 or 2 noise layers
-        snr_db = random.choice(cfg["snr_choices"])
-        noise1 = load_random_noise(all_noise_segments, SR, TARGET_LEN)
-        noises = [noise1]
-        if random.random() < cfg["double_noise_prob"]:
-            noise2 = load_random_noise(all_noise_segments, SR, TARGET_LEN)
-            noises.append(noise2)
+            # noise
+            for i, (srcn, n) in enumerate(noise_sel):
+                x = normalize_length(n, L)
+                g = random.uniform(*cfg["gain_n"])
+                x = apply_gain(x, g)
 
-        y = mix_with_noise_multi(x, noises, snr_db)
-        snr_values.append(snr_db)
+                if random.random() < cfg["rev_p_n"]:
+                    x = apply_reverb(x, SR, (0.2, 0.4))
+                if random.random() < cfg["bl_p_n"]:
+                    x = random_bandlimit(x, SR, dict(
+                        bp_prob=0.4, hp_prob=0.3, lp_min=2000, hp_min=80, hp_max=400
+                    ))
 
-        out_file = OUT_ROOT / "speech" / f"{sfile.stem}_aug.wav"
-        sf.write(out_file, y, SR)
-        writer.writerow({
-            "outfile": str(out_file),
-            "source": str(sfile),
-            "class": "speech",
-            "gain_db": round(gain_db, 2),
-            "snr_db": snr_db,
-            "shift_ms": round(shift_ms, 1),
-            "reverb": reverb_used,
-            "bandlimit": band_used,
-            "preset": args.preset
-        })
+                x = clip_guard(x)
+                sf.write(pdir / "noise" / f"noise_{i:05d}.wav", x, SR)
+                wr.writerow([i, "noise", preset, "", g, ""])
 
-    # --- Augment noise (light coloring) ---
-    for nfile in chosen_noise:
-        x = load_audio(nfile, SR)
-        x = normalize_length(x, TARGET_LEN)
+                gains.append(g)
+                rms_n.append(rms(x))
 
-        g_lo_n, g_hi_n = cfg["gain_noise_db"]
-        gain_db = random.uniform(g_lo_n, g_hi_n)
-        x = apply_gain(x, gain_db)
-        gain_values.append(gain_db)
+        # -------- plots --------
+        if snrs:
+            plt.hist(snrs, bins=20)
+            plt.title(f"SNR distribution ({preset})")
+            plt.savefig(pdir / "plots" / "snr_hist.png")
+            plt.close()
 
-        reverb_used = False
-        if random.random() < cfg["reverb_prob_noise"]:
-            x = apply_reverb(x, SR, t60_range=cfg["t60_range"])
-            reverb_used = True
-
-        band_used = False
-        if random.random() < cfg["bandlimit_prob_noise"]:
-            x = random_bandlimit(x, SR, bl_conf)
-            band_used = True
-
-        out_file = OUT_ROOT / "noise" / f"{Path(nfile).stem}_aug.wav"
-        sf.write(out_file, x, SR)
-        writer.writerow({
-            "outfile": str(out_file),
-            "source": str(nfile),
-            "class": "noise",
-            "gain_db": round(gain_db, 2),
-            "snr_db": "",
-            "shift_ms": "",
-            "reverb": reverb_used,
-            "bandlimit": band_used,
-            "preset": args.preset
-        })
-
-    mf.close()
-    print(f"Augmentation complete. Saved under {OUT_ROOT}")
-
-    # --- Histograms ---
-    if snr_values:
-        plt.figure(figsize=(10,4))
-        bins = np.arange(min(cfg["snr_choices"])-2, max(cfg["snr_choices"])+4, 2)
-        plt.hist(snr_values, bins=bins, edgecolor="black")
-        plt.title(f"SNR Distribution (Speech Augmentations) — preset={args.preset}")
-        plt.xlabel("SNR [dB]"); plt.ylabel("Count")
-        plt.tight_layout()
-        plt.savefig(OUT_ROOT / "snr_hist.png")
+        plt.hist(gains, bins=30)
+        plt.title(f"Gain distribution ({preset})")
+        plt.savefig(pdir / "plots" / "gain_hist.png")
         plt.close()
 
-    if gain_values:
-        plt.figure(figsize=(10,4))
-        plt.hist(gain_values, bins=30, edgecolor="black")
-        plt.title(f"Gain Distribution (All Augmentations) — preset={args.preset}")
-        plt.xlabel("Gain [dB]"); plt.ylabel("Count")
-        plt.tight_layout()
-        plt.savefig(OUT_ROOT / "gain_hist.png")
+        plt.hist(rms_s, bins=30, alpha=0.7, label="speech")
+        plt.hist(rms_n, bins=30, alpha=0.7, label="noise")
+        plt.legend()
+        plt.title(f"RMS overlap ({preset})")
+        plt.savefig(pdir / "plots" / "rms_overlap.png")
         plt.close()
 
-    print(f"Saved histogram plots to {OUT_ROOT}")
+    print("Done.")
+
 
 if __name__ == "__main__":
     with warnings.catch_warnings():
