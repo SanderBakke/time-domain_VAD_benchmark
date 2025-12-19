@@ -22,8 +22,13 @@ build/
 data/
 data_aug/
 data_aug_*/
+outputs/clips/
 outputs/
+heavy_15k/
+light_15k/
+noaug_15k/
 !outputs/.gitkeep
+vad_test_15k/
 
 # ---- Jupyter
 .ipynb_checkpoints/
