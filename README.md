@@ -1,4 +1,4 @@
-# time_domain_vad_benchmark
+# VAD Benchmark
 
 A compact, reproducible benchmark for **time-domain VAD** on MCUs/SoCs.  
 It includes classic baselines (Energy, ZCR, Energy∩ZCR “Combo”) and **WebRTC VAD (L2/L3)**, uses **SoC-aligned framing** (32 ms frames, 16 ms hop by default), and provides a tidy pipeline for  
